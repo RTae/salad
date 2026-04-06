@@ -13,6 +13,9 @@ default = dotdict(
     key_size=32,
     multi_query=False,
     sigma_data=10.0,
+    use_ga_bias=False,
+    normalize_points=False,
+    encoder_distogram=False,
     ## diffusion stack parameters
     depth=6,
     block_size=1,

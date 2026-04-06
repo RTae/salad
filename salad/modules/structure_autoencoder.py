@@ -571,6 +571,20 @@ class EncoderBlock(hk.Module):
             hk.LayerNorm([-1], True, True)(features),
             pos, pair, pair_mask,
             neighbours, resi, chain, batch, mask)
+        # Phase 5: optional distogram-guided second attention pass
+        if getattr(c, 'encoder_distogram', False):
+            _, dmap = InnerDistogram(c)(features, resi, chain, batch, None)
+            dmap_neighbours = extract_dmap_neighbours(32)(
+                jax.lax.stop_gradient(dmap), resi, chain, batch, mask)
+            dmap_pair, dmap_pair_mask = aa_decoder_pair_features(c)(
+                Vec3Array.from_array(pos), dmap_neighbours, resi, chain, batch, mask)
+            dmap_pair = MLP(
+                2 * c.pair_size, c.pair_size, activation=jax.nn.gelu,
+                final_init=init_linear())(dmap_pair)
+            features += SparseStructureAttention(c)(
+                hk.LayerNorm([-1], True, True)(features),
+                pos, dmap_pair, dmap_pair_mask,
+                dmap_neighbours, resi, chain, batch, mask)
         # local feature transition (always enabled)
         features += EncoderUpdate(c)(
                 hk.LayerNorm([-1], True, True)(features),
@@ -1124,11 +1138,20 @@ def random_rotation(batch):
         Vec3Array.from_array(y))
     return result
 
-def aa_decoder_pair_features(c):
-    """Pair features for the AADecoder module."""
+def _base_equivariant_pair_features(c):
+    """Shared equivariant pair feature computation for the encoder and decoder.
+
+    Computes the five standard equivariant pair features (sequence relative
+    position, inter-residue distance RBF, local-frame directions, relative
+    rotation, and local-frame coordinate vectors) and returns their sum
+    projected to `c.pair_size` together with the validity mask.
+    Both `aa_decoder_pair_features` and `decoder_pair_features` delegate to
+    this function so that all modules share identical pair representations.
+    """
     def inner(pos, neighbours, resi, chain, batch, mask):
-        pair_mask = mask[:, None] * mask[neighbours]
-        pair_mask *= neighbours != -1
+        if not isinstance(pos, Vec3Array):
+            pos = Vec3Array.from_array(pos)
+        pair_mask = mask[:, None] * mask[neighbours] * (neighbours != -1)
         pair = Linear(c.pair_size, bias=False, initializer="linear")(
             sequence_relative_position(32, one_hot=True, pseudo_chains=True)(
                 resi, chain, batch, neighbours))
@@ -1140,6 +1163,14 @@ def aa_decoder_pair_features(c):
             position_rotation_features(pos, neighbours))
         pair += Linear(c.pair_size, bias=False, initializer="linear")(
             pair_vector_features(pos, neighbours))
+        return pair, pair_mask
+    return inner
+
+def aa_decoder_pair_features(c):
+    """Pair features for the AADecoder module."""
+    def inner(pos, neighbours, resi, chain, batch, mask):
+        pair, pair_mask = _base_equivariant_pair_features(c)(
+            pos, neighbours, resi, chain, batch, mask)
         pair = hk.LayerNorm([-1], True, True)(pair)
         return pair, pair_mask
     return inner
@@ -1172,27 +1203,13 @@ def decoder_pair_features(c):
     """Pair features for the equivariant Decoder."""
     def inner(pos, dmap, neighbours,
               resi, chain, batch, mask):
-        pair_mask = mask[:, None] * mask[neighbours]
-        pair_mask *= neighbours != -1
-        index = axis_index(neighbours, axis=0)
+        pair, pair_mask = _base_equivariant_pair_features(c)(
+            pos, neighbours, resi, chain, batch, mask)
         if dmap is not None:
-            dmap = dmap[index[:, None], neighbours]
-        pair = Linear(c.pair_size, bias=False, initializer="linear")(
-            sequence_relative_position(32, one_hot=True, pseudo_chains=True)(
-                resi, chain, batch, neighbours))
-        if dmap is not None:
+            index = axis_index(neighbours, axis=0)
             pair += Linear(c.pair_size, initializer="linear", bias=False)(
                 jnp.where(pair_mask[..., None],
-                        distance_rbf(dmap), 0))
-        pos = Vec3Array.from_array(pos)
-        pair += Linear(c.pair_size, bias=False, initializer="linear")(
-            distance_features(pos, neighbours, d_min=0.0, d_max=22.0))
-        pair += Linear(c.pair_size, bias=False, initializer="linear")(
-            direction_features(pos, neighbours))
-        pair += Linear(c.pair_size, bias=False, initializer="linear")(
-            position_rotation_features(pos, neighbours))
-        pair += Linear(c.pair_size, bias=False, initializer="linear")(
-            pair_vector_features(pos, neighbours))
+                        distance_rbf(dmap[index[:, None], neighbours]), 0))
         pair = hk.LayerNorm([-1], True, True)(pair)
         pair = MLP(pair.shape[-1] * 2, pair.shape[-1], activation=jax.nn.gelu, final_init="linear")(pair)
         return pair, pair_mask

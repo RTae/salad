@@ -371,6 +371,110 @@ def vector_nonlinearity(vector: Vec3Array, direction: Vec3Array,
     scale = activation(agreement)
     return scale * vector
 
+def rotation_to_quaternion(rot) -> jnp.ndarray:
+    """Convert a Rot3Array rotation matrix to a unit quaternion (w, x, y, z).
+
+    Uses Shepperd's method with a differentiable weighted average over the
+    four numerically stable branches.
+    """
+    xx = rot.xx.astype(jnp.float32)
+    xy = rot.xy.astype(jnp.float32)
+    xz = rot.xz.astype(jnp.float32)
+    yx = rot.yx.astype(jnp.float32)
+    yy = rot.yy.astype(jnp.float32)
+    yz = rot.yz.astype(jnp.float32)
+    zx = rot.zx.astype(jnp.float32)
+    zy = rot.zy.astype(jnp.float32)
+    zz = rot.zz.astype(jnp.float32)
+    # Four Shepperd branches – each is stable when its t_k is largest.
+    t0 = jnp.sqrt(jnp.maximum(1.0 + xx + yy + zz, 1e-8))  # 2w
+    t1 = jnp.sqrt(jnp.maximum(1.0 + xx - yy - zz, 1e-8))  # 2x
+    t2 = jnp.sqrt(jnp.maximum(1.0 - xx + yy - zz, 1e-8))  # 2y
+    t3 = jnp.sqrt(jnp.maximum(1.0 - xx - yy + zz, 1e-8))  # 2z
+    q0 = jnp.stack([t0 / 2, (zy - yz) / (2 * t0),
+                    (xz - zx) / (2 * t0), (yx - xy) / (2 * t0)], axis=-1)
+    q1 = jnp.stack([(zy - yz) / (2 * t1), t1 / 2,
+                    (xy + yx) / (2 * t1), (zx + xz) / (2 * t1)], axis=-1)
+    q2 = jnp.stack([(xz - zx) / (2 * t2), (xy + yx) / (2 * t2),
+                    t2 / 2, (yz + zy) / (2 * t2)], axis=-1)
+    q3 = jnp.stack([(yx - xy) / (2 * t3), (zx + xz) / (2 * t3),
+                    (yz + zy) / (2 * t3), t3 / 2], axis=-1)
+    # Weight each branch by its squared denominator for differentiable selection.
+    w = jnp.stack([t0, t1, t2, t3], axis=-1) ** 2
+    w = w / w.sum(axis=-1, keepdims=True)
+    q = (w[..., 0:1] * q0 + w[..., 1:2] * q1
+         + w[..., 2:3] * q2 + w[..., 3:4] * q3)
+    q = q / jnp.sqrt(jnp.maximum((q ** 2).sum(axis=-1, keepdims=True), 1e-6))
+    return q
+
+def _quaternion_multiply(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
+    """Hamilton product of two quaternions (w, x, y, z)."""
+    aw, ax, ay, az = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
+    bw, bx, by, bz = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
+    return jnp.stack([
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    ], axis=-1)
+
+def _dual_quaternion_multiply(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
+    """Product of two dual quaternions (q_real | q_dual), each of shape (..., 8)."""
+    ar, ad = a[..., :4], a[..., 4:]
+    br, bd = b[..., :4], b[..., 4:]
+    cr = _quaternion_multiply(ar, br)
+    cd = _quaternion_multiply(ar, bd) + _quaternion_multiply(ad, br)
+    return jnp.concatenate([cr, cd], axis=-1)
+
+def _dual_quaternion_conjugate(m: jnp.ndarray) -> jnp.ndarray:
+    """Conjugate (= inverse for unit dual quaternions) of shape (..., 8)."""
+    sign = jnp.array([1., -1., -1., -1., 1., -1., -1., -1.], dtype=m.dtype)
+    return m * sign
+
+def frames_to_motor(frames) -> jnp.ndarray:
+    """Convert Rigid3Array frames to PGA dual-quaternion motors of shape (..., 8).
+
+    Each motor encodes rotation and translation jointly as a unit dual
+    quaternion (q_real, q_dual) where q_dual = 0.5 * t_pure * q_real.
+    """
+    q_r = rotation_to_quaternion(frames.rotation)          # (..., 4)
+    tx = frames.translation.x.astype(jnp.float32)
+    ty = frames.translation.y.astype(jnp.float32)
+    tz = frames.translation.z.astype(jnp.float32)
+    qw, qx, qy, qz = q_r[..., 0], q_r[..., 1], q_r[..., 2], q_r[..., 3]
+    # Dual part: q_d = 0.5 * (0, tx, ty, tz) ⊗ q_r
+    q_d = jnp.stack([
+        0.5 * (-tx * qx - ty * qy - tz * qz),
+        0.5 * ( tx * qw + ty * qz - tz * qy),
+        0.5 * (-tx * qz + ty * qw + tz * qx),
+        0.5 * ( tx * qy - ty * qx + tz * qw),
+    ], axis=-1)
+    return jnp.concatenate([q_r, q_d], axis=-1)           # (..., 8)
+
+class PGAMotorBias(hk.Module):
+    """SE(3)-invariant attention bias derived from PGA dual-quaternion motors.
+
+    Converts backbone frames to unit dual-quaternion motors, computes the
+    relative motor m_i^{-1} * m_j for each (i, neighbour-j) pair, and
+    projects the 8-component relative motor to per-head attention biases.
+    This replaces the quadratic point-cloud distance term in IPA when the
+    `use_ga_bias` config flag is set.
+    """
+    def __init__(self, heads: int,
+                 name: Optional[str] = "pga_motor_bias"):
+        super().__init__(name)
+        self.heads = heads
+
+    def __call__(self, frames, neighbours: jnp.ndarray) -> jnp.ndarray:
+        """Return (N, K, heads) SE(3)-invariant attention bias."""
+        motors = frames_to_motor(frames)                              # (N, 8)
+        motors_inv = _dual_quaternion_conjugate(motors)               # (N, 8)
+        motors_rel = _dual_quaternion_multiply(
+            motors_inv[:, None], motors[neighbours])                  # (N, K, 8)
+        bias = Linear(
+            self.heads, bias=False, initializer="linear")(motors_rel) # (N, K, heads)
+        return bias
+
 class SparseStructureMessage(hk.Module):
     """Message passing wrapper."""
     def __init__(self, config,
@@ -403,16 +507,22 @@ class SparseStructureAttention(hk.Module):
         c = self.config
         final_init = c.update_init if c.update_init else "zeros"
         frames, _ = extract_aa_frames(Vec3Array.from_array(pos))
+        use_ga_bias = getattr(c, 'use_ga_bias', False)
+        normalize_points = getattr(c, 'normalize_points', False)
         if c.multi_query:
             local_update = SparseInvariantMultiQueryAttention(
                 heads=c.heads, size=c.key_size,
-                final_init=final_init, normalize=self.normalize)(
+                final_init=final_init, normalize=self.normalize,
+                use_ga_bias=use_ga_bias,
+                normalize_points=normalize_points)(
                 local, pair, frames.to_array(),
                 neighbours, pair_mask)
         else:
             local_update = SparseInvariantPointAttention(
                 heads=c.heads, size=c.key_size,
-                final_init=final_init, normalize=self.normalize)(
+                final_init=final_init, normalize=self.normalize,
+                use_ga_bias=use_ga_bias,
+                normalize_points=normalize_points)(
                 local, pair, frames.to_array(),
                 neighbours, pair_mask)
         return local_update
@@ -429,11 +539,21 @@ class SemiEquivariantSparseStructureAttention(hk.Module):
                  resi, chain, batch, mask):
         c = self.config
         final_init = c.update_init if c.update_init else "zeros"
-        local_update = SparseSemiEquivariantPointAttention(
-            heads=c.heads, size=c.key_size,
-            final_init=final_init, normalize=self.normalize)(
-            local, pair, pos,
-            neighbours, pair_mask)
+        normalize_points = getattr(c, 'normalize_points', False)
+        if getattr(c, 'multi_query', False):
+            local_update = SparseMultiQuerySemiEquivariantPointAttention(
+                heads=c.heads, size=c.key_size,
+                final_init=final_init, normalize=self.normalize,
+                normalize_points=normalize_points)(
+                local, pair, pos,
+                neighbours, pair_mask)
+        else:
+            local_update = SparseSemiEquivariantPointAttention(
+                heads=c.heads, size=c.key_size,
+                final_init=final_init, normalize=self.normalize,
+                normalize_points=normalize_points)(
+                local, pair, pos,
+                neighbours, pair_mask)
         return local_update
 
 class SparseInvariantMultiQueryAttention(hk.Module):
@@ -441,6 +561,7 @@ class SparseInvariantMultiQueryAttention(hk.Module):
     def __init__(self, size=32, heads=4,
                  query_points=8, value_points=8,
                  final_init="zeros", normalize=False,
+                 use_ga_bias=False, normalize_points=False,
                  name: Optional[str]="ada_point_attention"):
         super().__init__(name=name)
         self.size = size
@@ -449,6 +570,8 @@ class SparseInvariantMultiQueryAttention(hk.Module):
         self.value_points = value_points
         self.final_init = final_init
         self.normalize = normalize
+        self.use_ga_bias = use_ga_bias
+        self.normalize_points = normalize_points
 
     def __call__(self, local, pair, frames, neighbours, mask):
         frames: Rigid3Array = Rigid3Array.from_array(frames.astype(jnp.float32))
@@ -485,9 +608,14 @@ class SparseInvariantMultiQueryAttention(hk.Module):
         )
         scale = jax.nn.softplus(gamma.reshape(1, 1, self.heads)) * w_C / 2
         attn_logits = jnp.einsum("ihc,ijhc->ijh", q / jnp.sqrt(q.shape[-1]), k[neighbours])
-        dist = ((qp[:, None] - kp[neighbours]).to_array() ** 2).sum(axis=(-1, -2))
         bias = Linear(self.heads, bias=False, initializer="linear")(pair)
-        attn_logits = w_L * (attn_logits - scale * dist + bias)
+        if self.use_ga_bias:
+            # Replace quadratic point-cloud term with SE(3)-invariant motor bias.
+            motor_bias = PGAMotorBias(self.heads)(frames, neighbours)
+            attn_logits = w_L * (attn_logits + scale * motor_bias + bias)
+        else:
+            dist = ((qp[:, None] - kp[neighbours]).to_array() ** 2).sum(axis=(-1, -2))
+            attn_logits = w_L * (attn_logits - scale * dist + bias)
         attn_logits = jnp.where(mask[..., None], attn_logits, -1e9)
         attn = jax.nn.softmax(attn_logits, axis=1)
         attn = jnp.where(mask[..., None], attn, 0)
@@ -497,9 +625,115 @@ class SparseInvariantMultiQueryAttention(hk.Module):
         pair_update = jnp.einsum("ijh,ijc->ihc", attn, pair).reshape(attn.shape[0], -1)
         point_update = to_local(
             jnp.einsum("ijh,ijhcd->ihcd", attn, vp.to_array()[neighbours]))
+        if self.normalize_points:
+            pt_vec = Vec3Array.from_array(point_update.astype(jnp.float32))
+            pt_vec = VectorLayerNorm()(pt_vec)
+            point_update = pt_vec.to_array().astype(local.dtype)
         point_update = point_update.reshape(attn.shape[0], -1)
         result = jnp.concatenate((local_update, pair_update, point_update), axis=-1)
         return Linear(local.shape[-1], bias=False, initializer=self.final_init)(result)
+
+class SparseMultiQuerySemiEquivariantPointAttention(hk.Module):
+    """Sparse semi-equivariant point attention with multi-query (1 key/value head).
+
+    Combines multi-query efficiency (single key/value head, multiple query
+    heads) with the translation-equivariant point features of
+    SparseSemiEquivariantPointAttention.
+    """
+    def __init__(self, size=32, heads=4,
+                 query_points=8, value_points=8,
+                 final_init="zeros", normalize=False,
+                 normalize_points=False,
+                 name: Optional[str] = "mq_se_point_attention"):
+        super().__init__(name=name)
+        self.size = size
+        self.heads = heads
+        self.query_points = query_points
+        self.value_points = value_points
+        self.final_init = final_init
+        self.normalize = normalize
+        self.normalize_points = normalize_points
+
+    def __call__(self, local, pair, pos, neighbours, mask):
+        """
+        Args:
+            local: (N, local_size) scalar node features
+            pair:  (N, K, pair_size) pair features
+            pos:   (N, atoms, 3) backbone atom positions (global, divided by sigma)
+            neighbours: (N, K) neighbour indices
+            mask:  (N, K) pair validity mask
+        """
+        if self.normalize:
+            local = hk.LayerNorm([-1], True, True)(local)
+        # Multi-query: query uses self.heads, key/value each use 1 head.
+        q = Linear(self.heads * self.size, bias=False, name="query")(local).reshape(
+            local.shape[0], self.heads, self.size)
+        k = Linear(1 * self.size, bias=False, name="key")(local).reshape(
+            local.shape[0], 1, self.size)
+        q = hk.LayerNorm([-1], False, False)(q)
+        k = hk.LayerNorm([-1], False, False)(k)
+        v = Linear(1 * self.size, bias=False, name="value")(local).reshape(
+            local.shape[0], 1, self.size)
+        # Global point queries (heads heads) – offset from Cα.
+        ca = pos[:, 1]                                              # (N, 3)
+        q_pts = Linear(self.heads * self.query_points * 3,
+                       name="query_points")(local)
+        q_pts = q_pts.reshape(local.shape[0], -1, 3) + ca[:, None]
+        q_g = q_pts.reshape(local.shape[0], self.heads, self.query_points, 3)
+        # Global point keys and values (1 head each).
+        kv_pts = Linear((self.query_points + self.value_points) * 3,
+                        name="key_value_points")(local)
+        kv_pts = kv_pts.reshape(local.shape[0], -1, 3) + ca[:, None]
+        kv_g = kv_pts.reshape(local.shape[0], 1,
+                               self.query_points + self.value_points, 3)
+        k_g, v_g = jnp.split(kv_g, [self.query_points], axis=-2)
+
+        bias = Linear(self.heads, bias=False, name="bias")(pair)
+
+        w_C = jnp.sqrt(2.0 / (9 * self.query_points))
+        w_L = jnp.sqrt(1.0 / 3)
+
+        gamma = hk.get_parameter(
+            "gamma", (self.heads,),
+            init=hk.initializers.Constant(jnp.log(jnp.exp(1.) - 1.))
+        )
+        dfactor = jax.nn.softplus(gamma.reshape(1, 1, self.heads)) * w_C / 2
+        # q_g[:, None]: (N, 1, heads, qp, 3); k_g[neighbours]: (N, K, 1, qp, 3)
+        # difference broadcasts to (N, K, heads, qp, 3).
+        dist = dfactor * jnp.square(
+            q_g[:, None] - k_g[neighbours]).sum(axis=(-1, -2))  # (N, K, heads)
+        # q: (N, heads, size); k[neighbours]: (N, K, 1, size) – h=1 broadcasts.
+        dot = jnp.sqrt(1.0 / self.size) * jnp.einsum(
+            "ihc,ijhc->ijh", q, k[neighbours])
+        attn_logits = w_L * (dot + bias - dist)
+
+        pair_mask = mask * (neighbours != -1)
+        attn_logits = jnp.where(pair_mask[..., None], attn_logits, -1e9)
+        attn = jax.nn.softmax(attn_logits, axis=1)
+        attn = jnp.where(pair_mask[..., None], attn, 0.0)
+
+        out_pair = jnp.einsum("ijh,ijc->ihc", attn, pair)
+        out_scalar = jnp.einsum("ijh,ijhc->ihc", attn, v[neighbours])
+        # v_g[neighbours]: (N, K, 1, vp, 3) – h=1 broadcasts over heads.
+        out_point = jnp.einsum(
+            "ijh,ijhpc->ihpc", attn, v_g[neighbours])        # (N, heads, vp, 3)
+        # Subtract Cα to keep only translation-equivariant offsets.
+        out_point_vec = Vec3Array.from_array(out_point.astype(jnp.float32))
+        out_point_vec = out_point_vec - Vec3Array.from_array(ca)[:, None, None]
+        if self.normalize_points:
+            out_point_vec = VectorLayerNorm()(out_point_vec)
+        out_norm = out_point_vec.norm()
+        out_point = out_point_vec.to_array().astype(local.dtype)
+
+        out = Linear(local.shape[-1], initializer=self.final_init, name="project_out")(
+            jnp.concatenate((
+                out_pair.reshape(*out_pair.shape[:-2], -1),
+                out_scalar.reshape(*out_scalar.shape[:-2], -1),
+                out_point.reshape(*out_point.shape[:-3], -1),
+                out_norm.reshape(*out_norm.shape[:-2], -1),
+            ), axis=-1)
+        )
+        return out.astype(local.dtype)
 
 class SparseAttention(hk.Module):
     """Sparse attention without point bias."""
@@ -638,6 +872,7 @@ class SparseSemiEquivariantPointAttention(hk.Module):
     def __init__(self, size=32, heads=4,
                  query_points=8, value_points=8,
                  final_init="zeros", normalize=False,
+                 normalize_points=False,
                  name: Optional[str]="ada_point_attention"):
         super().__init__(name=name)
         self.size = size
@@ -646,6 +881,7 @@ class SparseSemiEquivariantPointAttention(hk.Module):
         self.value_points = value_points
         self.final_init = final_init
         self.normalize = normalize
+        self.normalize_points = normalize_points
 
     def __call__(self, local, pair, pos, neighbours, mask):
         # this module is only translation equivariant
@@ -702,6 +938,8 @@ class SparseSemiEquivariantPointAttention(hk.Module):
         out_point = jnp.einsum("ijh,ijhpc->ihpc", attn, v_g[neighbours])
         out_point = Vec3Array.from_array(out_point.astype(jnp.float32))
         out_point: Vec3Array = out_point - Vec3Array.from_array(pos[:, 1])[:, None, None]
+        if self.normalize_points:
+            out_point = VectorLayerNorm()(out_point)
         out_norm = out_point.norm()
         out_point = out_point.to_array()
         out = Linear(size=local.shape[-1], initializer=self.final_init, name="project_out")(
@@ -720,6 +958,7 @@ class SparseInvariantPointAttention(hk.Module):
     def __init__(self, size=32, heads=4,
                  query_points=8, value_points=8,
                  final_init="zeros", normalize=False,
+                 use_ga_bias=False, normalize_points=False,
                  name: Optional[str]="ada_point_attention"):
         super().__init__(name=name)
         self.size = size
@@ -728,6 +967,8 @@ class SparseInvariantPointAttention(hk.Module):
         self.value_points = value_points
         self.final_init = final_init
         self.normalize = normalize
+        self.use_ga_bias = use_ga_bias
+        self.normalize_points = normalize_points
 
     def __call__(self, local, pair, frames, neighbours, mask):
         if self.normalize:
@@ -768,9 +1009,14 @@ class SparseInvariantPointAttention(hk.Module):
             init=hk.initializers.Constant(jnp.log(jnp.exp(1.) - 1.))
         )
         dfactor = jax.nn.softplus(gamma.reshape(1, 1, self.heads)) * w_C / 2
-        dist = dfactor * jnp.square(q_g[:, None] - k_g[neighbours]).sum(axis=(-1, -2))
         dot = jnp.sqrt(1 / self.size) * jnp.einsum("ihc,ijhc->ijh", q, k[neighbours])
-        attn_logits = w_L * (dot + bias - dist)
+        if self.use_ga_bias:
+            # Replace quadratic point-cloud term with SE(3)-invariant motor bias.
+            motor_bias = PGAMotorBias(self.heads)(frames, neighbours)
+            attn_logits = w_L * (dot + bias + dfactor * motor_bias)
+        else:
+            dist = dfactor * jnp.square(q_g[:, None] - k_g[neighbours]).sum(axis=(-1, -2))
+            attn_logits = w_L * (dot + bias - dist)
         if neighbours is None:
             pair_mask = mask
         else:
@@ -784,6 +1030,8 @@ class SparseInvariantPointAttention(hk.Module):
         out_point = jnp.einsum("ijh,ijhpc->ihpc", attn, v_g[neighbours])
         out_point = Vec3Array.from_array(out_point.astype(jnp.float32))
         out_point: Vec3Array = frames[:, None, None].apply_inverse_to_point(out_point)
+        if self.normalize_points:
+            out_point = VectorLayerNorm()(out_point)
         out_norm = out_point.norm()
         out_point = out_point.to_array()
         out = Linear(size=local.shape[-1], initializer=self.final_init, name="project_out")(

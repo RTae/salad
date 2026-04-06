@@ -17,6 +17,8 @@ default_vp = dotdict(
     heads=8,
     key_size=32,
     multi_query=False, # True # use multi-query attention
+    use_ga_bias=False,
+    normalize_points=False,
     ## diffusion stack parameters
     diffusion_depth=6,
     block_size=1,
